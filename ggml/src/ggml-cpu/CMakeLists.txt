@@ -245,7 +245,13 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/arch/x86/quants.c
             ggml-cpu/arch/x86/repack.cpp
             )
-
+        if (GGML_CPU_QILAI)
+            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_QILAI)
+            list(APPEND GGML_CPU_SOURCES
+                ggml-cpu/qilai/qilai.cpp
+                ggml-cpu/qilai/qilai.h
+            )
+        endif()
         if (MSVC)
             # instruction set detection for MSVC only
             if (GGML_NATIVE)
