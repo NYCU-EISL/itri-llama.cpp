@@ -18,6 +18,10 @@
 #    include "kleidiai/kleidiai.h"
 #endif
 
+#ifdef GGML_USE_CPU_QILAI
+#    include "qilai/qilai.h"
+#endif
+
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
 #    include "spacemit/ime.h"
 #endif
@@ -46,6 +50,12 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
         if (ggml_backend_amx_buffer_type()) {
             bufts.push_back(ggml_backend_amx_buffer_type());
+        }
+#endif
+
+#ifdef GGML_USE_CPU_QILAI
+        if (ggml_backend_cpu_qilai_buffer_type()) {
+            bufts.push_back(ggml_backend_cpu_qilai_buffer_type());
         }
 #endif
 
