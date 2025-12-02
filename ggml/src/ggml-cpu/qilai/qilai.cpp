@@ -10,6 +10,7 @@
 #include "quants.h"
 #include "traits.h"
 #include "vec.h"
+#include "nx27v.h"
 
 #include <algorithm>
 #include <cassert>
@@ -79,7 +80,7 @@ class tensor_traits_common : public tensor_traits_base {
 
         const bool src1_cont = ggml_is_contiguous(src1);
 
-        ggml_vec_dot_t const vec_dot      = ggml_vec_dot_q4_0_q8_0;
+        // ggml_vec_dot_t const vec_dot      = ggml_vec_dot_q4_0_q8_0;
         enum ggml_type const vec_dot_type = GGML_TYPE_Q8_0;
 
         // broadcast factors
@@ -104,6 +105,17 @@ class tensor_traits_common : public tensor_traits_base {
         const int64_t blck_1 = 16;
 
         const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
+
+        // GGML_LOG_INFO("SRC0 NE:");
+        // for (auto &i: src0->ne) {
+        //     GGML_LOG_INFO(" %lld", i);
+        // }
+        // GGML_LOG_INFO("\n");
+        // GGML_LOG_INFO("SRC1 NE:");
+        // for (auto &i: src1->ne) {
+        //     GGML_LOG_INFO(" %lld", i);
+        // }
+        // GGML_LOG_INFO("\n");
 
         // attempt to reduce false-sharing (does not seem to make a difference)
         // 16 * 2, accounting for mmla kernels
@@ -141,7 +153,17 @@ class tensor_traits_common : public tensor_traits_base {
                     //}
 
                     for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                        vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                        // vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                        nx27v_vec_dot_q4_0_q8_0(
+                            ne00,
+                            &tmp[ir0 - iir0],
+                            (num_rows_per_vec_dot > 1 ? 16 : 0),
+                            src0_row + ir0 * nb01,
+                            (num_rows_per_vec_dot > 1 ? nb01 : 0),
+                            src1_col,
+                            (num_rows_per_vec_dot > 1 ? src1_col_stride : 0),
+                            num_rows_per_vec_dot,
+                            params->ith);
                     }
 
                     for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
@@ -354,6 +376,13 @@ static const char * ggml_backend_cpu_qilai_buffer_type_get_name(ggml_backend_buf
 
 static ggml_backend_buffer_t ggml_backend_cpu_qilai_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft,
                                                                                         size_t size) {
+
+    static bool initialized = false;
+    if (!initialized) {
+        nx27v_init();
+        initialized = true;
+    }
+
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
 
     if (buffer == nullptr) {

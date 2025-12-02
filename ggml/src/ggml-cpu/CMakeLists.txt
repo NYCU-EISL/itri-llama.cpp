@@ -98,6 +98,17 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
     endif()
 
+    if (GGML_CPU_QILAI)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_QILAI)
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/qilai/qilai.cpp
+            ggml-cpu/qilai/qilai.h
+            ggml-cpu/qilai/nx27v.cpp
+            ggml-cpu/qilai/nx27v.h
+            ggml-cpu/qilai/my_msg.h
+        )
+    endif()
+
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
         list(APPEND GGML_CPU_SOURCES
@@ -245,13 +256,6 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/arch/x86/quants.c
             ggml-cpu/arch/x86/repack.cpp
             )
-        if (GGML_CPU_QILAI)
-            target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_QILAI)
-            list(APPEND GGML_CPU_SOURCES
-                ggml-cpu/qilai/qilai.cpp
-                ggml-cpu/qilai/qilai.h
-            )
-        endif()
         if (MSVC)
             # instruction set detection for MSVC only
             if (GGML_NATIVE)
