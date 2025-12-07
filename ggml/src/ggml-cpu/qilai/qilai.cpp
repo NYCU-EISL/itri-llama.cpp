@@ -1,16 +1,23 @@
+#include "ggml-impl.h"
+#include "ggml.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <ctime>
 #define GGML_COMMON_IMPL_CPP
 #define GGML_COMMON_DECL_CPP
-
-#include "qilai.h"
 
 #include "ggml-backend-impl.h"
 #include "ggml-common.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-cpu.h"
+#include "nx27v.h"
+#include "qilai.h"
 #include "quants.h"
 #include "traits.h"
 #include "vec.h"
-#include "nx27v.h"
+
+#include <time.h>
 
 #include <algorithm>
 #include <cassert>
@@ -27,20 +34,18 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
 
-// clang-format on
+constexpr size_t div_round_up(size_t a, size_t b) {
+  return (a + b - 1) / b;
+}
 
 namespace ggml::cpu::qilai {
 
-class tensor_traits_base : public ggml::cpu::tensor_traits {
-  public:
-    virtual int repack(struct ggml_tensor * t, const void * data, size_t data_size) = 0;
-};
-
-class tensor_traits_common : public tensor_traits_base {
+  class tensor_traits : public ggml::cpu::tensor_traits {
     bool work_size(int /* n_threads */, const struct ggml_tensor * op, size_t & size) override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
-                size = ggml_nelements(op->src[0]) * sizeof(float);
+                size = ggml_row_size(GGML_TYPE_Q8_0, ggml_nelements(op->src[1])) * 4;
+                size = ((size + QK4_0 - 1) / QK4_0) * (QK4_0 * sizeof(float) + sizeof(float));
                 return true;
             default:
                 // GGML_ABORT("fatal error");
@@ -53,7 +58,11 @@ class tensor_traits_common : public tensor_traits_base {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 if (op->src[0]->type == GGML_TYPE_Q4_0) {
-                    forward_mul_mat(params, op);
+                    // forward_mul_mat(params, op);
+                    forward_mul_mat_q4(params, op);
+                    // GGML_LOG_INFO("[Thread %d] GGML_OP_MUL_MAT src0: [%d, %d, %d, %d] src1: [%d, %d, %d, %d].\n", 
+                    //     params->ith, op->src[0]->ne[0], op->src[0]->ne[1], op->src[0]->ne[2], op->src[0]->ne[3],
+                    //                  op->src[1]->ne[0], op->src[1]->ne[1], op->src[1]->ne[2], op->src[1]->ne[3]);
                     return true;
                 }
             default:
@@ -61,6 +70,221 @@ class tensor_traits_common : public tensor_traits_base {
                 break;
         }
         return false;
+    }
+
+    static void forward_mul_mat_q4(ggml_compute_params * params, ggml_tensor * op) {
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+        ggml_tensor * dst = op;
+
+        GGML_ASSERT(src0->type == GGML_TYPE_Q4_0); // Only accepts Q4_0 source
+
+        GGML_TENSOR_BINARY_OP_LOCALS;
+
+        // Thread info
+        const int ith = params->ith;
+        const int nth = params->nth;
+
+        const size_t batch_src0 = ne02 * ne03;
+        const size_t batch_src1 = ne12 * ne13;
+        const size_t m = ne11;
+        const size_t k = ne10; // ne10 == ne00
+        const size_t n = ne01;
+
+        GGML_ASSERT(batch_src0 == 1); // Only support single batch for src0
+
+        // Calc the size of qunated src1
+        const size_t block_count_k = div_round_up(k, QK4_0);
+        const size_t src1_q8_0_size_per_batch = m * block_count_k * sizeof(block_q8_0);
+        const size_t src1_q8_0_row_stride = block_count_k * sizeof(block_q8_0);
+        const size_t src1_q8_0_stride = 
+            div_round_up(src1_q8_0_size_per_batch, alignof(uint64_t)) * alignof(uint64_t); // Round to nearest uint64_t
+        const size_t src1_q8_0_size = batch_src1 * src1_q8_0_stride;
+
+        // Check params->wdata is large enough to store quanted src1
+        const size_t desired_wsize = src1_q8_0_size + alignof(uint64_t) - 1;
+        if (ith == 0 && params->wsize < desired_wsize) {
+            throw std::runtime_error("wsize less than desired_wsize");
+        }
+
+        std::vector<matrix_mul_q4_0_q8_0_params> matmul_params_vec(batch_src1);
+        for (size_t batch_idx = 0; batch_idx < batch_src1; ++batch_idx) {
+            matrix_mul_q4_0_q8_0_params matmul_params;
+            matmul_params.src0 = (void *)src0->data;
+            matmul_params.src1 = (void *)(params->wdata + batch_idx * src1_q8_0_stride);
+            matmul_params.dst = (float *)dst->data + batch_idx * ne0 * ne1;
+
+            matmul_params.ne00 = ne00; matmul_params.ne01 = ne01;
+            matmul_params.ne02 = ne02; matmul_params.ne03 = ne03;
+
+            matmul_params.ne10 = ne10; matmul_params.ne11 = ne11;
+            matmul_params.ne12 = ne12; matmul_params.ne13 = ne13;
+
+            matmul_params.ne0 = ne0; matmul_params.ne1 = ne1;
+            matmul_params.ne2 = ne2; matmul_params.ne3 = ne3;
+
+            matmul_params.nb00 = nb00; matmul_params.nb01 = nb01;
+            matmul_params.nb02 = nb02; matmul_params.nb03 = nb03;
+
+            // Store quanted
+            matmul_params.nb10 = sizeof(block_q8_0);
+            matmul_params.nb11 = src1_q8_0_row_stride;
+            matmul_params.nb12 = src1_q8_0_size_per_batch; 
+            matmul_params.nb13 = 1;
+
+            matmul_params.nb0 = nb0; matmul_params.nb1 = nb1;
+            matmul_params.nb2 = nb2; matmul_params.nb3 = nb3;
+
+            matmul_params_vec[batch_idx] = matmul_params;
+        }
+        
+        // Set wdata pointer to align to uint64_t
+        void * wdata = reinterpret_cast<void *>((reinterpret_cast<uintptr_t>(params->wdata) + alignof(uint64_t) - 1) & 
+                            (~(alignof(uint64_t) - 1)));
+
+        // Quant src1 to q8_0
+        if (src1->type == GGML_TYPE_F32) {
+
+            GGML_ASSERT(nb10 == sizeof(float) && 
+                        nb11 == ne10 * sizeof(float) && 
+                        nb12 == ne11 * nb11); // src1 is contiguous float matrix
+
+            // Divide the work among threads
+            constexpr int num_rows_per_task = 4;
+            const int task_count_per_batch = div_round_up(m, num_rows_per_task);
+            const int task_count = batch_src1 * task_count_per_batch;
+            const int task_count_per_thread = (task_count + nth - 1) / nth;
+
+            // This thread's task range
+            const int task_begin = ith * task_count_per_thread;
+            const int task_end = std::min((ith + 1) * task_count_per_thread, task_count);
+
+            for (int task_idx = task_begin; task_idx < task_end; ++task_idx) {
+                const int batch_idx = task_idx / task_count_per_batch;
+                const int task_idx_in_batch = task_idx % task_count_per_batch;
+                const int m_idx = task_idx_in_batch * num_rows_per_task;
+
+                const int rows_to_be_handled = std::min(num_rows_per_task, (int)(m - m_idx));
+
+                const size_t src1_ptr_offset = batch_idx * nb12 + m_idx * nb11;
+                const size_t quant_src1_ptr_offset = batch_idx * src1_q8_0_stride + m_idx * src1_q8_0_row_stride;
+
+                float * src1_ptr = (float *)src1->data + src1_ptr_offset / sizeof(float);
+                block_q8_0 * quant_src1_ptr = (block_q8_0 *)((char *)wdata + quant_src1_ptr_offset);
+
+                quantize_row_q8_0(src1_ptr, quant_src1_ptr, k * rows_to_be_handled);
+            }
+        }
+        
+
+        ggml_barrier(params->threadpool);
+
+        // Compute mul_mat using q4_0 src0 and q8_0 src1
+        // if (ith == 0)
+        // GGML_LOG_INFO("[Thread %d] GGML_OP_MUL_MAT with Q4_0 x Q8_0: m = %zu, n = %zu, k = %zu, batch_src1 = %zu\n", 
+        //     ith, m, n, k, batch_src1);
+
+        // if (ith == 0)
+        //     GGML_LOG_INFO("[Thread %d] dst: [%d, %d, %d, %d].\n", 
+        //         ith, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
+
+        // Divide the work among threads by tiling dst matrix
+        const int tile_m_size = 16;
+        const int tile_n_size = (m == 1) ? 64 : 16; // Use wider tile for vector-matrix mul
+
+        const int tile_m_count_per_batch = div_round_up(m, tile_m_size);
+        const int tile_n_count_per_batch = div_round_up(n, tile_n_size);
+        const int tile_count_per_batch = tile_m_count_per_batch * tile_n_count_per_batch;
+        const int tile_count = batch_src1 * tile_count_per_batch;
+
+        // if (ith == 0)
+        // GGML_LOG_INFO("[Thread %d] total tiles: %d (tile_m_count_per_batch=%d, tile_n_count_per_batch=%d)\n", 
+        //     ith, tile_count, tile_m_count_per_batch, tile_n_count_per_batch);
+
+        // Each thread handles multiple tiles
+        {
+            const int tiles_per_thread = div_round_up(tile_count, nth);
+            const int tile_begin = ith * tiles_per_thread;
+            const int tile_end = std::min((ith + 1) * tiles_per_thread, tile_count);
+
+            // GGML_LOG_INFO("[Thread %d] handling tiles %d to %d\n", ith, tile_begin, tile_end);
+
+            for (int tile_idx = tile_begin; tile_idx < tile_end; ++tile_idx) {
+                const int batch_idx = tile_idx / tile_count_per_batch;
+                const int tile_idx_in_batch = tile_idx % tile_count_per_batch;
+                const int tile_m_idx = tile_idx_in_batch / tile_n_count_per_batch;
+                const int tile_n_idx = tile_idx_in_batch % tile_n_count_per_batch;
+
+                // GGML_LOG_INFO("[Thread %d] processing tile %d (batch %d, tile_m_idx %d, tile_n_idx %d)\n", 
+                //     ith, tile_idx, batch_idx, tile_m_idx, tile_n_idx);
+
+                // Row and col start index of the tile
+                const size_t m_start = tile_m_idx * tile_m_size;
+                const size_t m_count = std::min((size_t)tile_m_size, m - m_start);
+
+                const size_t n_start = tile_n_idx * tile_n_size;
+                const size_t n_count = std::min((size_t)tile_n_size, n - n_start);
+
+                // GGML_LOG_INFO("[Thread %d] tile %d: m_start=%zu, m_count=%zu, n_start=%zu, n_count=%zu\n", 
+                //     ith, tile_idx, m_start, m_count, n_start, n_count);
+
+                // Prepare pointers
+                matrix_mul_q4_0_q8_0_params & matmul_params = matmul_params_vec[batch_idx];
+
+                const size_t src0_ptr_offset = n_start * nb01;
+                const size_t src1_ptr_offset = m_start * src1_q8_0_row_stride + batch_idx * src1_q8_0_stride;
+                const size_t dst_ptr_offset =  n_start * nb0 + m_start * nb1 + batch_idx * nb2;
+
+                // GGML_LOG_INFO("[Thread %d] tile %d: src0_ptr_offset=%zu, src1_ptr_offset=%zu, dst_ptr_offset=%zu\n", 
+                //     ith, tile_idx, src0_ptr_offset, src1_ptr_offset, dst_ptr_offset);
+
+                void * src0_ptr = src0->data + src0_ptr_offset;
+                void * src1_ptr = wdata + src1_ptr_offset;
+                float * dst_ptr = (float *)dst->data + dst_ptr_offset / sizeof(float);
+
+                // Compute the tile
+                if (ith < 1) {
+                    // Use NX27V accelerator for first few threads
+	                // GGML_LOG_INFO("[QILAI] T%d: Src0:[%d, %d] Src1:[%d, %d]\n", ith, ne00, ne01, ne10, ne11);
+                    nx27v_mat_mul_tile_q4_0_q8_0(matmul_params, m_start, m_count, n_start, n_count, ith);
+                } else {
+                    // Use CPU implementation for other threads
+                    static thread_local unsigned long long counter = 0, n_counter = 0;
+                    static thread_local double calc_time = 0.0;
+
+                    timespec start_time, end_time;
+                    clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+                    for (size_t im = 0; im < m_count; ++im) {
+                        for (size_t in = 0; in < n_count; ++in) {
+                            void * src0_elem_ptr = src0_ptr + (in * nb01);
+                            void * src1_elem_ptr = src1_ptr + (im * src1_q8_0_row_stride);
+                            float * dst_elem_ptr = dst_ptr + (in * nb0 + im * nb1) / sizeof(float);
+
+                            // GGML_LOG_INFO("[Thread %d] tile %d: computing dst[%zu, %zu], src0_ptr_offset=%zu, src1_ptr_offset=%zu, dst_ptr_offset=%zu\n", 
+                            //     ith, tile_idx, m_start + im, n_start + in, 
+                            //     ((size_t)src0_elem_ptr - (size_t)src0_ptr), 
+                            //     ((size_t)src1_elem_ptr - (size_t)src1_ptr), 
+                            //     ((size_t)dst_elem_ptr - (size_t)dst_ptr));
+
+                            ggml_vec_dot_q4_0_q8_0(k, dst_elem_ptr, 0, src0_elem_ptr, 0, src1_elem_ptr, 0, 1);
+                        }
+                    }
+		    
+                    clock_gettime(CLOCK_MONOTONIC, &end_time);		    
+                    calc_time += (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
+                    n_counter += matmul_params.ne00 * m_count * n_count;
+                    if (++counter % 1000 == 0) {
+                    GGML_LOG_INFO("[QILAI T%d] Avg. ms of %llu matmul tiles: calc=%.6f, calc_per_n=%.6f\n", ith, counter, calc_time * 1e3 / counter, calc_time * 1e3 / n_counter);
+                    }
+                }
+            }
+        }
+        // static thread_local long long counter = 0;
+        // if (counter++ % 1000 == 0) {
+        //     GGML_LOG_INFO("[NX27V] Thread %d finished %lld tiles\n", ith, counter);
+        // }
+
     }
 
     static void ggml_compute_forward_mul_mat_one_chunk(
@@ -73,6 +297,7 @@ class tensor_traits_common : public tensor_traits_base {
         const int64_t ir1_start,
         const int64_t ir1_end) {
 
+
         const struct ggml_tensor * src0 = dst->src[0];
         const struct ggml_tensor * src1 = dst->src[1];
 
@@ -80,14 +305,14 @@ class tensor_traits_common : public tensor_traits_base {
 
         const bool src1_cont = ggml_is_contiguous(src1);
 
-        // ggml_vec_dot_t const vec_dot      = ggml_vec_dot_q4_0_q8_0;
+        ggml_vec_dot_t const vec_dot      = ggml_vec_dot_q4_0_q8_0;
         enum ggml_type const vec_dot_type = GGML_TYPE_Q8_0;
 
         // broadcast factors
         const int64_t r2 = ne12 / ne02;
         const int64_t r3 = ne13 / ne03;
 
-        //printf("ir0_start = %6lld, ir0_end = %6lld, ir1_start = %6lld, ir1_end = %6lld\n", ir0_start, ir0_end, ir1_start, ir1_end);
+        // printf("ir0_start = %6lld, ir0_end = %6lld, ir1_start = %6lld, ir1_end = %6lld\n", ir0_start, ir0_end, ir1_start, ir1_end);
 
         // threads with no work simply yield (not sure if it helps)
         if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
@@ -152,18 +377,34 @@ class tensor_traits_common : public tensor_traits_base {
                     //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
                     //}
 
+                    // GGML_LOG_INFO("[NX27V] Thread %d: Prepared src0 at offset 0x%lx, src1 at offset 0x%lx\n", params->ith, src0_addr_offset, src1_addr_offset);
+
                     for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                         // vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
-                        nx27v_vec_dot_q4_0_q8_0(
-                            ne00,
-                            &tmp[ir0 - iir0],
-                            (num_rows_per_vec_dot > 1 ? 16 : 0),
-                            src0_row + ir0 * nb01,
-                            (num_rows_per_vec_dot > 1 ? nb01 : 0),
-                            src1_col,
-                            (num_rows_per_vec_dot > 1 ? src1_col_stride : 0),
-                            num_rows_per_vec_dot,
-                            params->ith);
+                        
+                        if (params->ith < 0) {
+                            nx27v_vec_dot_q4_0_q8_0(
+                                ne00,
+                                &tmp[ir0 - iir0],
+                                (num_rows_per_vec_dot > 1 ? 16 : 0),
+                                src0_row + ir0 * nb01,
+                                (num_rows_per_vec_dot > 1 ? nb01 : 0),
+                                src1_col,
+                                (num_rows_per_vec_dot > 1 ? src1_col_stride : 0),
+                                num_rows_per_vec_dot,
+                                params->ith);
+
+                            // float ref_ans = 0.0f;
+                            // vec_dot(ne00, &ref_ans, (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+
+                            // if (std::abs(tmp[ir0 - iir0] - ref_ans) > 1e-3) {
+                            //     GGML_LOG_INFO("[NX27V] Thread %d: MISMATCH at ir0=%lld, ir1=%lld: accelerator=%f, reference=%f\n", params->ith, ir0, ir1, tmp[ir0 - iir0], ref_ans);
+                            // }
+                        } else {
+                            vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                        }
+
+
                     }
 
                     for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
@@ -216,6 +457,7 @@ class tensor_traits_common : public tensor_traits_base {
         GGML_ASSERT(nb1 <= nb2);
         GGML_ASSERT(nb2 <= nb3);
 
+        // Transform src1 to the same computation type if needed
         if (src1->type != vec_dot_type) {
             void * wdata = params->wdata;
 
@@ -311,13 +553,8 @@ class tensor_traits_common : public tensor_traits_base {
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
         }
     }
-
-    int repack(struct ggml_tensor * t, const void * data, size_t data_size) override {
-        memcpy(t->data, data, data_size);
-        return 0;
-    }
 };
-static const tensor_traits_common             qilai_impl;
+static const tensor_traits             qilai_impl;
 
 }  // namespace ggml::cpu::qilai
 
@@ -359,9 +596,11 @@ static void ggml_backend_qilai_buffer_set_tensor(ggml_backend_buffer_t buffer,
     GGML_ASSERT(offset == 0);
     GGML_ASSERT(size == ggml_nbytes(tensor));
 
-    auto tensor_traits = (ggml::cpu::qilai::tensor_traits_base *) tensor->extra;
+    auto tensor_traits = (ggml::cpu::qilai::tensor_traits *) tensor->extra;
     if (tensor_traits) {
-        auto OK = tensor_traits->repack(tensor, data, size);
+        // auto OK = tensor_traits->repack(tensor, data, size);
+        memcpy(tensor->data, data, size);
+        int OK = 0;
         GGML_ASSERT(OK == 0);
     }
 
