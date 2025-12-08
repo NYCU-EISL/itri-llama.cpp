@@ -170,18 +170,15 @@ void nx27v_vec_dot_q4_0_q8_0(int n, float * s, size_t bs,
 void nx27v_mat_mul_tile_q4_0_q8_0(matrix_mul_q4_0_q8_0_params &params,
 				  size_t m_start, size_t m_count, size_t n_start, size_t n_count,
 				  int ith_thread) {
-    assert(ith_thread >= 0 && ith_thread < RPMSG_EPT_NUM);
+    assert(ith_thread >= 0 && ith_thread < RPMSG_EPT_NUM && "thread idx is larger than available RPMSG channel");
 
     void * src0 = params.src0; // Q4_0
     void * src1 = params.src1; // Q8_0
-    float *      dst  = params.dst;  // F32
+    float *dst  = params.dst;  // F32
 
     const size_t m = params.ne11;
     const size_t k = params.ne10;
     const size_t n = params.ne01;
-
-    uint64_t src0_addr_offset = SHARE_MEM_SRC0_OFFSET + ith_thread * SHARE_MEM_SIZE_PER_THREAD;
-    uint64_t src1_addr_offset = SHARE_MEM_SRC1_OFFSET + ith_thread * SHARE_MEM_SIZE_PER_THREAD;
 
     // Profiling
     static thread_local uint64_t counter = 0;
@@ -190,6 +187,8 @@ void nx27v_mat_mul_tile_q4_0_q8_0(matrix_mul_q4_0_q8_0_params &params,
     static thread_local double write_req_time = 0.0;
     static thread_local double read_resp_time = 0.0;
     static thread_local double memcpy_dst_time = 0.0;
+    static thread_local uint64_t nx27v_warmup_cycles = 0;
+    static thread_local uint64_t nx27v_actual_cycles = 0;
     timespec start_time, end_time;
 
     // Check if data is already on the remote
@@ -198,8 +197,7 @@ void nx27v_mat_mul_tile_q4_0_q8_0(matrix_mul_q4_0_q8_0_params &params,
     static thread_local void *last_src1 = nullptr;
     static thread_local size_t last_src0_len = 0;
     static thread_local size_t last_src1_len = 0;
-    static thread_local uint64_t nx27v_warmup_cycles = 0;
-    static thread_local uint64_t nx27v_actual_cycles = 0;
+
     static thread_local uint64_t src0_cpy = 0;
     static thread_local uint64_t src1_cpy = 0;
     static thread_local uint64_t src_whole_matrix = 0;
@@ -210,50 +208,64 @@ void nx27v_mat_mul_tile_q4_0_q8_0(matrix_mul_q4_0_q8_0_params &params,
     size_t src0_len;
     size_t src1_len;
 
-    if (params.nb02 <= SHARE_MEM_SRC_MAT_SIZE && params.nb12 <= SHARE_MEM_SRC_MAT_SIZE && false) {
-      src0_start_ptr = src0;
-      src1_start_ptr = src1;
-      src0_len = params.nb02;
-      src1_len = params.nb12;
-      whole_matrix = true;
-      
-      src_whole_matrix++;
+    // Try to put the whole matrix into share memory at once
+    uint64_t src0_share_mem_size = GGML_PAD(params.nb02, sizeof(uint64_t));
+    uint64_t src1_share_mem_size = GGML_PAD(params.nb12, sizeof(uint64_t));
+    uint64_t dst_share_mem_size = GGML_PAD(m * n, sizeof(uint64_t));
 
-    } else {
-      assert(n_count * params.nb01 <= SHARE_MEM_SRC_MAT_SIZE && "src0 tile exceeds shared memory capacity");
-      assert(m_count * params.nb11 <= SHARE_MEM_SRC_MAT_SIZE && "src1 tile exceeds shared memory capacity");
-    //   GGML_LOG_INFO("src0 ne [%d %d %d %d] nb [%d %d %d %d],\nsrc1 ne [%d %d %d %d] nb [%d %d %d %d]\n",
-	// 	    params.ne00, params.ne01, params.ne02, params.ne03, params.nb00, params.nb01, params.nb02, params.nb03,
-	// 	    params.ne10, params.ne11, params.ne12, params.ne13, params.nb10, params.nb11, params.nb12, params.nb13);
+    uint64_t src0_addr_offset = 0;
+    uint64_t src1_addr_offset = src0_addr_offset + src0_share_mem_size;
+    uint64_t dst_addr_offset = src1_addr_offset + src1_share_mem_size;     
+
+    if (dst_addr_offset + dst_share_mem_size <= SHARE_MEM_SIZE_PER_THREAD && false) {
+        src0_start_ptr = src0;
+        src1_start_ptr = src1;
+        src0_len = params.nb02;
+        src1_len = params.nb12;
+        whole_matrix = true;
       
-      src0_start_ptr = src0 + (n_start * params.nb01);
-      src1_start_ptr = src1 + (m_start * params.nb11);
-      src0_len = n_count * params.nb01;
-      src1_len = m_count * params.nb11;
+        src_whole_matrix++;
+    } else {
+        // Put only the required part into share mem
+        src0_share_mem_size = GGML_PAD(n_count * params.nb01, sizeof(uint64_t));
+        src1_share_mem_size = GGML_PAD(m_count * params.nb11, sizeof(uint64_t));
+        dst_share_mem_size = GGML_PAD(m_count * n_count, sizeof(uint64_t));
+
+        src0_addr_offset = 0;
+        src1_addr_offset = src0_addr_offset + src0_share_mem_size;
+        dst_addr_offset  = src1_addr_offset + src1_share_mem_size; 
+
+        GGML_ASSERT(dst_addr_offset + dst_share_mem_size <= SHARE_MEM_SIZE_PER_THREAD && "src0 tile exceeds shared memory capacity");
+      
+        src0_start_ptr = src0 + (n_start * params.nb01);
+        src1_start_ptr = src1 + (m_start * params.nb11);
+        src0_len = n_count * params.nb01;
+        src1_len = m_count * params.nb11;
     }
 
-    assert(n_count * m_count * params.nb0 <= SHARE_MEM_RESULT_MAT_SIZE && "result tile exceeds share memory capacity");
+    // Add thread offset
+    src0_addr_offset += ith_thread * SHARE_MEM_SIZE_PER_THREAD;
+    src1_addr_offset += ith_thread * SHARE_MEM_SIZE_PER_THREAD;
+    dst_addr_offset += ith_thread * SHARE_MEM_SIZE_PER_THREAD;
 
     clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-    if (!(ith_thread == last_ith && src0_start_ptr == last_src0 && src0_len <= last_src0_len)) {
-      memcpy((void *)(share_addr + src0_addr_offset), src0_start_ptr, src0_len);
-      src0_cpy++;
-    }
+    if (!(ith_thread == last_ith && src0_start_ptr == last_src0 && src0_len == last_src0_len) ||
+        !(ith_thread == last_ith && src1_start_ptr == last_src1 && src1_len == last_src1_len)) {
+        memcpy((void *)(share_addr + src0_addr_offset), src0_start_ptr, src0_len);
+        src0_cpy++;
+        memcpy((void *)(share_addr + src1_addr_offset), src1_start_ptr, src1_len);
+        src1_cpy++;
 
-    if (!(ith_thread == last_ith && src1_start_ptr == last_src1 && src1_len <= last_src1_len)) {
-      memcpy((void *)(share_addr + src1_addr_offset), src1_start_ptr, src1_len);
-      src1_cpy++;
+        last_ith = ith_thread;
+        last_src0 = src0_start_ptr;
+        last_src1 = src1_start_ptr;
+        last_src0_len = src0_len;
+        last_src1_len = src1_len;
     }
 
     clock_gettime(CLOCK_MONOTONIC, &end_time);
     memcpy_src_time += (end_time.tv_sec - start_time.tv_sec) + (end_time.tv_nsec - start_time.tv_nsec) / 1e9;
-
-    // last_ith = ith_thread;
-    // last_src0 = src0_start_ptr;
-    // last_src1 = src1_start_ptr;
-    // last_src0_len = src0_len;
-    // last_src1_len = src1_len;
 
     my_msg msg = {
         .opcode = MSG_OP_MAT_MUL_Q4_0_Q8_0,
@@ -263,7 +275,7 @@ void nx27v_mat_mul_tile_q4_0_q8_0(matrix_mul_q4_0_q8_0_params &params,
         .src1_nb = { (uint32_t)(params.nb10), (uint32_t)(params.nb11), 0, 0 },
         .src0_addr = (uint64_t)(SHARE_MEM_ADDR + src0_addr_offset + (whole_matrix ? n_start * params.nb01 : 0)),
         .src1_addr = (uint64_t)(SHARE_MEM_ADDR + src1_addr_offset + (whole_matrix ? m_start * params.nb11 : 0)),
-        .result_addr = (uint64_t)(SHARE_MEM_ADDR + SHARE_MEM_RESULT_OFFSET + ith_thread * SHARE_MEM_SIZE_PER_THREAD),
+        .result_addr = (uint64_t)(SHARE_MEM_ADDR + dst_addr_offset),
     };
 
     // GGML_LOG_INFO("[T%d] Sending message to accelerator", ith_thread);
@@ -293,15 +305,15 @@ void nx27v_mat_mul_tile_q4_0_q8_0(matrix_mul_q4_0_q8_0_params &params,
 
     // GGML_LOG_INFO("[T%d] Copying result back to dst matrix\n", ith_thread);
 
-    for (size_t im = 0; im < m_count; ++im) {
-        for (size_t in = 0; in < n_count; ++in) {
-            void * src0_elem_ptr = src0 + ((n_start + in) * params.nb01);
-            void * src1_elem_ptr = src1 + ((m_start + im) * params.nb11);
-            float * dst_elem_ptr = dst + ((n_start + in) * params.nb0 + (m_start + im) * params.nb1) / sizeof(float);
+    // for (size_t im = 0; im < m_count; ++im) {
+    //     for (size_t in = 0; in < n_count; ++in) {
+    //         void * src0_elem_ptr = src0 + ((n_start + in) * params.nb01);
+    //         void * src1_elem_ptr = src1 + ((m_start + im) * params.nb11);
+    //         float * dst_elem_ptr = dst + ((n_start + in) * params.nb0 + (m_start + im) * params.nb1) / sizeof(float);
 
-            ggml_vec_dot_q4_0_q8_0(k, dst_elem_ptr, 0, src0_elem_ptr, 0, src1_elem_ptr, 0, 1);
-        }
-    }
+    //         ggml_vec_dot_q4_0_q8_0(k, dst_elem_ptr, 0, src0_elem_ptr, 0, src1_elem_ptr, 0, 1);
+    //     }
+    // }
 
     // GGML_LOG_INFO("[NX27V] T%d: Src0:[%d, %d] Src1:[%d, %d]\n", ith_thread, params.ne00, params.ne01, params.ne10, params.ne11);
     // GGML_ASSERT(params.nb0 == sizeof(float));
@@ -316,12 +328,12 @@ void nx27v_mat_mul_tile_q4_0_q8_0(matrix_mul_q4_0_q8_0_params &params,
     for (size_t im = 0; im < m_count; ++im) {
         for (size_t in = 0; in < n_count; ++in) {
             float * dst_elem_ptr = dst + ((n_start + in) * params.nb0 + (m_start + im) * params.nb1) / sizeof(float);
-            float * src_elem_ptr = (float *)(share_addr + SHARE_MEM_RESULT_OFFSET + ith_thread * SHARE_MEM_SIZE_PER_THREAD
+            float * src_elem_ptr = (float *)(share_addr + dst_addr_offset
                             + (in * sizeof(float)) + (im * n_count * sizeof(float)));
 
-            if (std::abs(*dst_elem_ptr - *src_elem_ptr) > 1e-3) {
-                GGML_LOG_INFO("[NX27V T%d] Dst[%d, %d] is different, ref=%f, nx27v=%f\n", ith_thread, in, im, *dst_elem_ptr, *src_elem_ptr);
-            }
+            // if (std::abs(*dst_elem_ptr - *src_elem_ptr) > 1e-3) {
+            //     GGML_LOG_INFO("[NX27V T%d] Dst[%d, %d] is different, ref=%f, nx27v=%f\n", ith_thread, in, im, *dst_elem_ptr, *src_elem_ptr);
+            // }
             
             *dst_elem_ptr = *src_elem_ptr;
         }
@@ -339,25 +351,12 @@ void nx27v_mat_mul_tile_q4_0_q8_0(matrix_mul_q4_0_q8_0_params &params,
             read_resp_time * 1e3 / counter,
             memcpy_dst_time * 1e3 / counter,
             read_resp_time * 1e3 / n_counter);
-        GGML_LOG_INFO("[NX27V T%d] Avg. cycle count: warmup=%ld actual=%ld\n",
-            ith_thread, (nx27v_warmup_cycles / counter), (nx27v_actual_cycles / counter));
-        // GGML_LOG_INFO("[NX27V T%d] Avg. cycle count: %ld\n",
-        // 	    ith_thread, (nx27v_warmup_cycles / counter));
+        // GGML_LOG_INFO("[NX27V T%d] Avg. cycle count: warmup=%ld actual=%ld\n",
+        //     ith_thread, (nx27v_warmup_cycles / counter), (nx27v_actual_cycles / counter));
+        GGML_LOG_INFO("[NX27V T%d] Avg. cycle count: %ld\n",
+        	    ith_thread, (nx27v_warmup_cycles / counter));
         GGML_LOG_INFO("[NX27V T%d] src0_cpy=%ld src1_cpy=%ld src_whole=%ld\n",
             ith_thread, src0_cpy, src1_cpy, src_whole_matrix);
     }
-
-
-
-    // n_counter += n;
-    // if (++counter % 1000 == 0) {
-    //	GGML_LOG_INFO("[NX27V] T%d: Avg. ms of %lu: memcpy_src=%.6f, write_req=%.6f, read_resp=%.6f, read_resp_per_n=%.6f\n",
-    //	       ith_thread,
-    //	       counter,
-    //	       memcpy_src_time * 1e3 / counter,
-    //	       write_req_time  * 1e3 / counter,
-    //	       read_resp_time  * 1e3 / counter,
-    //	       read_resp_time  * 1e3 / n_counter);
-    // }
 
 }
