@@ -25,6 +25,8 @@
 #include <cstdio>  // for GGML_ASSERT
 #include <stdexcept>
 #include <thread>
+#include <map>
+#include <tuple>
 
 // clang-format off
 
@@ -176,7 +178,6 @@ namespace ggml::cpu::qilai {
             }
         }
         
-
         ggml_barrier(params->threadpool);
 
         // Compute mul_mat using q4_0 src0 and q8_0 src1
@@ -280,10 +281,70 @@ namespace ggml::cpu::qilai {
                 }
             }
         }
-        // static thread_local long long counter = 0;
-        // if (counter++ % 1000 == 0) {
-        //     GGML_LOG_INFO("[NX27V] Thread %d finished %lld tiles\n", ith, counter);
-        // }
+
+        // Profiling
+        struct ne_pair {
+            int ne0[4], ne1[4];
+
+            ne_pair() {}
+            ne_pair(int a, int b, int c, int d, int e, int f, int g, int h) {
+                ne0[0] = a;
+                ne0[1] = b;
+                ne0[2] = c;
+                ne0[3] = d;
+                ne1[0] = e;
+                ne1[1] = f;
+                ne1[2] = g;
+                ne1[3] = h;
+            }
+
+            bool operator<(const ne_pair & other) const noexcept {
+                const int lhs[8] = {ne0[0], ne0[1], ne0[2], ne0[3], ne1[0], ne1[1], ne1[2], ne1[3]};
+                const int rhs[8] = {other.ne0[0], other.ne0[1], other.ne0[2], other.ne0[3],
+                                    other.ne1[0], other.ne1[1], other.ne1[2], other.ne1[3]};
+                for (int i = 0; i < 8; ++i) {
+                    if (lhs[i] != rhs[i]) return lhs[i] < rhs[i];
+                }
+                return false;
+            }
+        };
+
+        static thread_local long long counter = 0;
+        static thread_local std::map<ne_pair, int> ne_stat;
+
+        ne_stat[ne_pair(ne00, ne01, ne02, ne03, ne10, ne11, ne12, ne13)]++;
+
+        if (++counter % 100 == 0) {
+            GGML_LOG_INFO("[NX27V T%d] finished %lld matmul\n", ith, counter);
+
+            std::map<int, std::vector<ne_pair>> ko_board;
+            for (auto &[ne, cnt]: ne_stat) {
+                ko_board[-cnt].push_back(ne);
+            }
+
+            GGML_LOG_INFO("[QILAI T%d] Top 10 dim:\n", ith);
+            int print_num = 0;
+            bool flag = false;
+            for (auto &[cnt, ne_vec]: ko_board) {
+                for (auto &ne: ne_vec) {
+                    if (print_num++ < 10) {
+                        GGML_LOG_INFO("            ne0[");
+                        
+                        for (auto i: ne.ne0)
+                            GGML_LOG_INFO(" %d", i);
+                        GGML_LOG_INFO("] ne1[");
+                        for (auto i: ne.ne1)
+                            GGML_LOG_INFO(" %d", i);
+                        GGML_LOG_INFO("]: %d\n", -cnt);
+                    } else {
+                        flag=true;
+                        break;
+                    }
+                }
+                if (flag) break;
+            }
+
+        }
 
     }
 
