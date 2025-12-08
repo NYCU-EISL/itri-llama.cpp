@@ -189,8 +189,8 @@ namespace ggml::cpu::qilai {
         //         ith, dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
 
         // Divide the work among threads by tiling dst matrix
-        const int tile_m_size = 16;
-        const int tile_n_size = (m == 1) ? 64 : 16; // Use wider tile for vector-matrix mul
+        const int tile_m_size = 64;
+        const int tile_n_size = 64; // Use wider tile for vector-matrix mul
 
         const int tile_m_count_per_batch = div_round_up(m, tile_m_size);
         const int tile_n_count_per_batch = div_round_up(n, tile_n_size);
